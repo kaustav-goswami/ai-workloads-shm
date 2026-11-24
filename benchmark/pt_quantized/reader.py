@@ -25,6 +25,13 @@ def main():
         "against an independently-quantized local reference."
     )
     add_backend_args(parser)
+    parser.add_argument(
+        "--keep-writer-alive",
+        action="store_true",
+        help="Skip signal_reader_done() so the writer keeps waiting instead of "
+        "exiting and unlinking the region -- lets this reader be run repeatedly "
+        "against the same still-alive writer.",
+    )
     args = parser.parse_args()
 
     region, use_dax, path = open_reader_region(args)
@@ -77,7 +84,8 @@ def main():
         f"max abs diff {quant_error:.4f} ({rel_error * 100:.2f}% of peak fp32 magnitude)."
     )
 
-    signal_reader_done(sync_tensor)
+    if not args.keep_writer_alive:
+        signal_reader_done(sync_tensor)
     region.close(unlink=False)
 
 

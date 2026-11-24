@@ -24,6 +24,13 @@ def main():
         description="PT-Dense reader: attach shared LLaMA-style weights and run GEMM forward pass."
     )
     add_backend_args(parser)
+    parser.add_argument(
+        "--keep-writer-alive",
+        action="store_true",
+        help="Skip signal_reader_done() so the writer keeps waiting instead of "
+        "exiting and unlinking the region -- lets this reader be run repeatedly "
+        "against the same still-alive writer.",
+    )
     args = parser.parse_args()
 
     region, use_dax, path = open_reader_region(args)
@@ -53,7 +60,8 @@ def main():
         max_diff = (out - expected).abs().max().item()
         raise RuntimeError(f"PT-Dense reader: FAILURE - max diff {max_diff}")
 
-    signal_reader_done(sync_tensor)
+    if not args.keep_writer_alive:
+        signal_reader_done(sync_tensor)
     region.close(unlink=False)
 
 
