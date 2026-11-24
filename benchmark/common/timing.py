@@ -5,9 +5,9 @@ from contextlib import contextmanager
 class TimingRecorder:
     """Collects named latency samples (seconds) and prints/exports a summary.
 
-    Every SHM operation that matters for a fragmentation/perf study - alloc,
-    lookup, resize, attach - gets recorded under a short "op" tag plus an
-    optional per-object label, so the summary can break down cost by op type.
+    Every operation that matters for a workload's performance - build, init,
+    forward, step - gets recorded under a short "op" tag plus an optional
+    per-item label, so the summary can break down cost by op type.
     """
 
     def __init__(self, label=""):

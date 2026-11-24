@@ -1,9 +1,12 @@
+import argparse
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from benchmark.common.seeds import deterministic_seed
+from benchmark.common.timing import TimingRecorder
 from benchmark.pt_dense.model import LlamaDecoderLayer, RMSNorm
 
 
@@ -139,3 +142,77 @@ def default_config():
         "batch_size": 2,
         "seq_len": 8,
     }
+
+
+def build_model(config=None):
+    config = default_config() if config is None else config
+    model = MultiTenantModel(
+        hidden_size=config["hidden_size"],
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        intermediate_size=config["intermediate_size"],
+        num_experts=config["num_experts"],
+        lora_rank=config["lora_rank"],
+    )
+    return model.to(config["dtype"])
+
+
+def initialize_weights(model):
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(deterministic_seed(name))
+            if param.ndim == 1:
+                param.fill_(1.0)
+            elif "lora_a" in name:
+                param.copy_(torch.randn(param.shape, generator=generator, dtype=param.dtype) * 0.01)
+            elif "lora_b" in name:
+                param.zero_()
+            elif "gate" in name and "moe" in name:
+                param.copy_(torch.randn(param.shape, generator=generator, dtype=param.dtype) * 0.01)
+            else:
+                param.copy_(torch.randn(param.shape, generator=generator, dtype=param.dtype) * 0.02)
+
+
+def local_activation_input(config=None):
+    config = default_config() if config is None else config
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(7)
+    return torch.randn(
+        config["batch_size"],
+        config["seq_len"],
+        config["hidden_size"],
+        generator=generator,
+        dtype=config["dtype"],
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="PT-MultiTenant: shared LLaMA backbone with per-layer LoRA adapters and "
+        "an 8-expert Top-2 MoE. All weights are ordinary tensors allocated with PyTorch's "
+        "default CPU allocator."
+    )
+    parser.parse_args()
+
+    print("PT-MultiTenant: building hybrid model and initializing weights...")
+    config = default_config()
+    recorder = TimingRecorder(label="PT-MultiTenant")
+    with recorder.time("build"):
+        model = build_model(config)
+    with recorder.time("init"):
+        initialize_weights(model)
+
+    x = local_activation_input(config)
+    print(f"PT-MultiTenant: running forward pass on activations {tuple(x.shape)}...")
+    with recorder.time("forward"):
+        with torch.no_grad():
+            out = model(x)
+    recorder.print_summary()
+
+    print(f"PT-MultiTenant: output shape {tuple(out.shape)}, mean {out.float().mean().item():.6f}")
+    print("PT-MultiTenant: SUCCESS - routed adapter/MoE forward pass completed.")
+
+
+if __name__ == "__main__":
+    main()

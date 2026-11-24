@@ -1,8 +1,12 @@
+import argparse
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from benchmark.common.seeds import deterministic_seed
+from benchmark.common.timing import TimingRecorder
 
 
 class RMSNorm(nn.Module):
@@ -90,3 +94,68 @@ def default_config():
         "batch_size": 2,
         "seq_len": 16,
     }
+
+
+def build_model(config=None):
+    config = default_config() if config is None else config
+    model = LlamaDenseModel(
+        hidden_size=config["hidden_size"],
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        intermediate_size=config["intermediate_size"],
+    )
+    return model.to(config["dtype"])
+
+
+def initialize_weights(model):
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(deterministic_seed(name))
+            if "norm" in name or name.endswith(".weight") and param.ndim == 1:
+                param.fill_(1.0)
+            else:
+                param.copy_(torch.randn(param.shape, generator=generator, dtype=param.dtype) * 0.02)
+
+
+def local_activation_input(config=None):
+    config = default_config() if config is None else config
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(42)
+    return torch.randn(
+        config["batch_size"],
+        config["seq_len"],
+        config["hidden_size"],
+        generator=generator,
+        dtype=config["dtype"],
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="PT-Dense: monolithic LLaMA-style dense transformer. Weights and "
+        "activations are ordinary tensors allocated with PyTorch's default CPU allocator."
+    )
+    parser.parse_args()
+
+    print("PT-Dense: building model and initializing weights...")
+    config = default_config()
+    recorder = TimingRecorder(label="PT-Dense")
+    with recorder.time("build"):
+        model = build_model(config)
+    with recorder.time("init"):
+        initialize_weights(model)
+
+    x = local_activation_input(config)
+    print(f"PT-Dense: running forward pass on activations {tuple(x.shape)}...")
+    with recorder.time("forward"):
+        with torch.no_grad():
+            out = model(x)
+    recorder.print_summary()
+
+    print(f"PT-Dense: output shape {tuple(out.shape)}, mean {out.float().mean().item():.6f}")
+    print("PT-Dense: SUCCESS - dense GEMM forward pass completed.")
+
+
+if __name__ == "__main__":
+    main()

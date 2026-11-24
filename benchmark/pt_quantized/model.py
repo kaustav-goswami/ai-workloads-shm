@@ -1,19 +1,21 @@
+import argparse
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from benchmark.pt_dense.model import RMSNorm
+from benchmark.common.timing import TimingRecorder
+from benchmark.pt_dense.model import LlamaDenseModel, RMSNorm
+from benchmark.pt_dense.model import initialize_weights as initialize_reference_weights
+from benchmark.pt_dense.model import local_activation_input
 
 
 class QuantLinear(nn.Module):
     """A Linear layer whose weight lives as int8 + a per-output-channel fp32
     scale (symmetric quantization, no zero-point), dequantized on the fly in
-    forward(). qweight/scale are buffers (not Parameters) so they show up in
-    state_dict() and can be shared through SHM with the same generic
-    copy_state_dict_to_shm/attach_state_dict_from_shm helpers every other
-    workload uses - no bespoke SHM plumbing needed for quantized tensors.
+    forward(). qweight/scale are ordinary buffers allocated with PyTorch's
+    default CPU allocator.
     """
 
     def __init__(self, in_features, out_features):
@@ -107,3 +109,110 @@ def default_config():
         "batch_size": 2,
         "seq_len": 16,
     }
+
+
+def build_reference_model(config=None):
+    """The 'true' fp32 model that gets quantized. Reuses PT-Dense's exact
+    architecture and deterministic initialization.
+    """
+    config = default_config() if config is None else config
+    model = LlamaDenseModel(
+        hidden_size=config["hidden_size"],
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        intermediate_size=config["intermediate_size"],
+    )
+    initialize_reference_weights(model)
+    return model
+
+
+def build_quantized_model(config=None):
+    config = default_config() if config is None else config
+    return QuantizedDenseModel(
+        hidden_size=config["hidden_size"],
+        num_layers=config["num_layers"],
+        num_heads=config["num_heads"],
+        intermediate_size=config["intermediate_size"],
+    )
+
+
+def quantize_tensor(weight):
+    """Per-output-channel symmetric int8 quantization (no zero-point):
+    scale[o] = max(|weight[o, :]|) / 127, qweight[o, i] = round(weight[o, i] / scale[o]).
+    """
+    absmax = weight.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    scale = absmax / 127.0
+    qweight = torch.clamp(torch.round(weight / scale), -127, 127).to(torch.int8)
+    return qweight, scale.squeeze(1)
+
+
+def _quantize_into(quant_linear, fp32_weight):
+    qweight, scale = quantize_tensor(fp32_weight)
+    with torch.no_grad():
+        quant_linear.qweight.copy_(qweight)
+        quant_linear.scale.copy_(scale)
+
+
+def quantize_model(quant_model, ref_model):
+    """Populate every QuantLinear buffer in `quant_model` by quantizing the
+    matching fp32 weight from `ref_model`. Both models share identical
+    submodule names (mirrored 1:1), so layers line up positionally.
+    """
+    with torch.no_grad():
+        quant_model.norm.weight.copy_(ref_model.norm.weight)
+        for qlayer, rlayer in zip(quant_model.layers, ref_model.layers):
+            qlayer.input_layernorm.weight.copy_(rlayer.input_layernorm.weight)
+            qlayer.post_attention_layernorm.weight.copy_(rlayer.post_attention_layernorm.weight)
+            _quantize_into(qlayer.self_attn.q_proj, rlayer.self_attn.q_proj.weight)
+            _quantize_into(qlayer.self_attn.k_proj, rlayer.self_attn.k_proj.weight)
+            _quantize_into(qlayer.self_attn.v_proj, rlayer.self_attn.v_proj.weight)
+            _quantize_into(qlayer.self_attn.o_proj, rlayer.self_attn.o_proj.weight)
+            _quantize_into(qlayer.mlp.gate_proj, rlayer.mlp.gate_proj.weight)
+            _quantize_into(qlayer.mlp.up_proj, rlayer.mlp.up_proj.weight)
+            _quantize_into(qlayer.mlp.down_proj, rlayer.mlp.down_proj.weight)
+    return quant_model
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="PT-Quantized: quantize an fp32 LLaMA-style decoder to per-channel "
+        "int8 weight + fp32 scale. Both the fp32 reference and the quantized model live "
+        "in ordinary process memory allocated by PyTorch's default CPU allocator."
+    )
+    parser.parse_args()
+
+    print("PT-Quantized: building fp32 reference model and quantizing to int8...")
+    config = default_config()
+    ref_model = build_reference_model(config)
+    quant_model = build_quantized_model(config)
+    quantize_model(quant_model, ref_model)
+
+    fp32_bytes = sum(t.numel() * t.element_size() for t in ref_model.state_dict().values())
+    quant_bytes = sum(t.numel() * t.element_size() for t in quant_model.state_dict().values())
+    print(
+        f"PT-Quantized: fp32 footprint={fp32_bytes / (1024 * 1024):.2f} MiB, "
+        f"quantized footprint={quant_bytes / (1024 * 1024):.2f} MiB "
+        f"({fp32_bytes / quant_bytes:.2f}x smaller)."
+    )
+
+    x = local_activation_input(config)
+    recorder = TimingRecorder(label="PT-Quantized")
+    print(f"PT-Quantized: running forward pass with activations {tuple(x.shape)}...")
+    with recorder.time("forward"):
+        with torch.no_grad():
+            out = quant_model(x)
+    recorder.print_summary()
+
+    with torch.no_grad():
+        fp32_out = ref_model(x)
+    quant_error = (out - fp32_out).abs().max().item()
+    rel_error = quant_error / fp32_out.abs().max().item()
+    print(
+        f"PT-Quantized: int8 quantization error vs true fp32 - "
+        f"max abs diff {quant_error:.4f} ({rel_error * 100:.2f}% of peak fp32 magnitude)."
+    )
+    print("PT-Quantized: SUCCESS - quantized forward pass completed.")
+
+
+if __name__ == "__main__":
+    main()
